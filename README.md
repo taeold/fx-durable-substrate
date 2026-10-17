@@ -142,7 +142,7 @@ kubectl ate create egress-policy demo-agent-fork -a ate-demo-fx -f egress-policy
 
 ### 5. Send divergent prompts to both branches
 
-Both actors auto-resume on demand from the shared Turn 1 history (`cursor: 1..8`) and diverge on Turn 2 (`cursor: 9..`):
+Both actors auto-resume on demand from the shared Turn 1 history (`cursor: 1..8`) and diverge on Turn 2 (`cursor: 10..14`, after `session.resume()` emits `idle` at `cursor: 9`):
 
 ```bash
 # Original actor continues on Branch A
@@ -161,26 +161,26 @@ curl -N -X POST http://localhost:8000/submit \
 Streamed output from `demo-agent` (Branch A):
 
 ```json
-{"type":"turn_start","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add multiply(a, b) and structured logging to app.js.","epoch":2,"cursor":9}
-{"type":"tool_start","id":"call_edit_multiply","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function multiply(a, b) {\n  return a * b;\n}\n"},"epoch":2,"cursor":10}
-{"type":"tool_end","id":"call_edit_multiply","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":11}
-{"type":"text_delta","delta":"Added `multiply(a, b)` to `app.js`.","epoch":2,"cursor":12}
-{"type":"turn_end","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","stopReason":"end_turn","usage":{},"epoch":2,"cursor":13}
+{"type":"turn_start","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add multiply(a, b) and structured logging to app.js.","epoch":2,"cursor":10}
+{"type":"tool_start","id":"call_edit_multiply","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function multiply(a, b) {\n  return a * b;\n}\n"},"epoch":2,"cursor":11}
+{"type":"tool_end","id":"call_edit_multiply","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":12}
+{"type":"text_delta","delta":"Added `multiply(a, b)` to `app.js`.","epoch":2,"cursor":13}
+{"type":"turn_end","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","stopReason":"end_turn","usage":{},"epoch":2,"cursor":14}
 ```
 
 Streamed output from `demo-agent-fork` (Branch B):
 
 ```json
-{"type":"turn_start","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add divide(a, b) and edge-case tests to test.js.","epoch":2,"cursor":9}
-{"type":"tool_start","id":"call_edit_divide","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function divide(a, b) {\n  if (b === 0) throw new Error('div by zero');\n  return a / b;\n}\n"},"epoch":2,"cursor":10}
-{"type":"tool_end","id":"call_edit_divide","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":11}
-{"type":"text_delta","delta":"Added `divide(a, b)` with error check to `app.js`.","epoch":2,"cursor":12}
-{"type":"turn_end","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","stopReason":"end_turn","usage":{},"epoch":2,"cursor":13}
+{"type":"turn_start","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add divide(a, b) and edge-case tests to test.js.","epoch":2,"cursor":10}
+{"type":"tool_start","id":"call_edit_divide","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function divide(a, b) {\n  if (b === 0) throw new Error('div by zero');\n  return a / b;\n}\n"},"epoch":2,"cursor":11}
+{"type":"tool_end","id":"call_edit_divide","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":12}
+{"type":"text_delta","delta":"Added `divide(a, b)` with error check to `app.js`.","epoch":2,"cursor":13}
+{"type":"turn_end","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","stopReason":"end_turn","usage":{},"epoch":2,"cursor":14}
 ```
 
-You can also replay or tail either actor's event stream from any cursor:
+You can also replay or tail either actor's event stream from any cursor (even waking a suspended actor on demand):
 
 ```bash
-curl -N "http://localhost:8000/events?cursor=8" \
+curl -N "http://localhost:8000/events?cursor=9" \
   -H "ate-target-actor: ate-demo-fx/demo-agent-fork"
 ```
