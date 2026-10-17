@@ -19,9 +19,7 @@ const agent = createFxAgent({
   tools: createCodingTools("/workspace"),
 });
 
-// Get-or-create the actor's session:
-// - On initial actor boot, runs/ is empty, so agent.session(undefined) creates a new session.
-// - On resume/fork, readdir finds the existing "wrun_<ulid>.json" and reopens that exact session.
+// Open the existing session from disk if one exists, or start a new one.
 const [existingRun] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
 const sessionId = existingRun ? existingRun.replace(/\.json$/, "") : undefined;
 const session = agent.session(sessionId);
@@ -50,15 +48,17 @@ server.listen(80, "0.0.0.0");
 
 ## How it works
 
-`libfx` runs the coding agent loop and persists every conversation turn, tool call step, and stream chunk to `/workspace/.fx/sessions` via `local({ dir })`.
+An AI coding agent has two kinds of state: the files it edits in the working directory, and its conversation history. This setup puts both inside `/workspace`, which Agent Substrate mounts as a persistent directory. `libfx` writes its session files to `/workspace/.fx/sessions`, and the agent's tools read and write code in `/workspace`.
 
-Agent Substrate runs each agent as an isolated actor with `/workspace` mounted as a durable directory (`durableDir` in `template.yaml`).
+Because each actor has its own `/workspace`, one actor holds one conversation. When the server starts, it checks `/workspace/.fx/sessions/runs` for an existing session file. On a fresh actor the folder is empty, so `libfx` starts a new session. When an actor wakes up from a snapshot or starts from a fork, the server finds the existing session file and continues that conversation.
 
-1. **Suspend and auto-resume**: When you suspend an actor (`kubectl ate suspend actor`), Agent Substrate sends `SIGTERM` so `libfx` releases its session lease (`await agent.close()`), snapshots `/workspace` to object storage, and stops the container. When the next HTTP request arrives for that actor, the router restores `/workspace` onto a worker pod and wakes the server back up before forwarding the request. On local kind, snapshots are stored in the bundled in-cluster S3 store (`rustfs`); on GKE, `atelet` and `ate-api-server` write snapshots to GCS using Workload Identity without any storage credentials in the actor.
-2. **Actor-scoped session lifecycle (get-or-create)**: In `local({ dir })` mode, `libfx` stores sessions as `runs/wrun_<ulid>.json`. On initial boot, `runs/` is empty so `agent.session(undefined)` creates a fresh session. On wake or fork, `existingRun` automatically finds and reopens the snapshot's existing run (`agent.session(sessionId)`), ensuring the session identity travels with the volume snapshot across forks without callers having to manage session IDs.
-3. **Reconnectable event streaming**: `POST /submit` streams newline-delimited JSON (`turn.readable`) as the turn runs, stamping every event with a `cursor`. `GET /events?cursor=N` (`session.stream(cursor)`) replays or tails the session's durable event log from any cursor—even across actor suspends, restarts, or forks.
-4. **Checkpoint and fork**: Because both the agent session history (`.fx/sessions`) and the working files live in `/workspace`, you can tag a suspended actor (`kubectl ate create tag`) and create a new actor from that tag (`kubectl ate create actor --tag`). Both actors start from the same history and files, then diverge on subsequent requests.
-5. **Egress credential injection**: The sandbox runs with a placeholder `AI_GATEWAY_API_KEY`. Outbound calls to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which injects the real `Authorization` header from `egress-policy.yaml` so secrets never enter the sandbox or its snapshots.
+**Suspend and wake.** When you suspend an actor, Agent Substrate sends `SIGTERM` to the container. The server closes the `libfx` agent to flush any open state, and Agent Substrate snapshots `/workspace` to object storage before stopping the container. On local kind, snapshots go to the in-cluster S3 store. On GKE, the node agent uploads them to GCS using Workload Identity, so the container never holds storage credentials. When a new HTTP request arrives for a suspended actor, the router restores `/workspace` onto a worker pod, waits for `/readyz`, and forwards the request.
+
+**Forking.** Because the conversation history and the working files live on the same volume, snapshotting an actor captures both at the same point in time. You can tag a suspended actor's snapshot and create a second actor from that tag. Both actors wake up with the same prior turns and files, and diverge from there as you send them different prompts.
+
+**Streaming and replay.** `libfx` writes every streamed event to disk with a sequence number called a cursor. Posting a prompt to `/submit` streams those events back as newline-delimited JSON while the turn runs. If a client disconnects, or if you want to inspect an actor after it wakes or forks, requesting `/events` with a cursor replays the saved events after that point and stays open for new ones.
+
+**Credentials.** The container only sees a placeholder API key. Outbound requests to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which swaps in the real key from a Kubernetes secret. The real key never enters the container or the volume snapshots.
 
 ## Quickstart (local Kubernetes with kind)
 
@@ -147,7 +147,7 @@ kubectl ate create egress-policy demo-agent-fork -a ate-demo-fx -f egress-policy
 
 ### 5. Send divergent prompts to both branches
 
-Both actors auto-resume on demand from the shared Turn 1 history (`cursor: 1..8`) and diverge on Turn 2 (`cursor: 10..14`, after `session.resume()` emits `idle` at `cursor: 9`):
+Both actors wake up on demand from the shared Turn 1 history and diverge on Turn 2:
 
 ```bash
 # Original actor continues on Branch A
@@ -163,7 +163,7 @@ curl -N -X POST http://localhost:8000/submit \
   -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
 ```
 
-Streamed output from `demo-agent` (Branch A):
+Streamed output from `demo-agent` on Branch A:
 
 ```json
 {"type":"turn_start","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add multiply(a, b) and structured logging to app.js.","epoch":2,"cursor":10}
@@ -173,7 +173,7 @@ Streamed output from `demo-agent` (Branch A):
 {"type":"turn_end","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","stopReason":"end_turn","usage":{},"epoch":2,"cursor":14}
 ```
 
-Streamed output from `demo-agent-fork` (Branch B):
+Streamed output from `demo-agent-fork` on Branch B:
 
 ```json
 {"type":"turn_start","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add divide(a, b) and edge-case tests to test.js.","epoch":2,"cursor":10}
@@ -183,7 +183,7 @@ Streamed output from `demo-agent-fork` (Branch B):
 {"type":"turn_end","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","stopReason":"end_turn","usage":{},"epoch":2,"cursor":14}
 ```
 
-You can also replay or tail either actor's event stream from any cursor (even waking a suspended actor on demand):
+You can also replay or tail either actor's event stream from a cursor:
 
 ```bash
 curl -N "http://localhost:8000/events?cursor=9" \
