@@ -12,8 +12,12 @@ const agent = createFxAgent({
   tools: createCodingTools("/workspace"),
 });
 
-const [run] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
-const session = agent.session(run?.slice(0, -5));
+// Get-or-create the actor's session:
+// - On initial actor boot, runs/ is empty, so agent.session(undefined) creates a new session.
+// - On resume/fork, readdir finds the existing "wrun_<ulid>.json" and reopens that exact session.
+const [existingRun] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
+const sessionId = existingRun ? existingRun.replace(/\.json$/, "") : undefined;
+const session = agent.session(sessionId);
 await session.resume().result;
 
 const server = http.createServer(async (req, res) => {

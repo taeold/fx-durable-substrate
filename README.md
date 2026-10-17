@@ -19,8 +19,12 @@ const agent = createFxAgent({
   tools: createCodingTools("/workspace"),
 });
 
-const [run] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
-const session = agent.session(run?.slice(0, -5));
+// Get-or-create the actor's session:
+// - On initial actor boot, runs/ is empty, so agent.session(undefined) creates a new session.
+// - On resume/fork, readdir finds the existing "wrun_<ulid>.json" and reopens that exact session.
+const [existingRun] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
+const sessionId = existingRun ? existingRun.replace(/\.json$/, "") : undefined;
+const session = agent.session(sessionId);
 await session.resume().result;
 
 const server = http.createServer(async (req, res) => {
@@ -51,9 +55,10 @@ server.listen(80, "0.0.0.0");
 Agent Substrate runs each agent as an isolated actor with `/workspace` mounted as a durable directory (`durableDir` in `template.yaml`).
 
 1. **Suspend and auto-resume**: When you suspend an actor (`kubectl ate suspend actor`), Agent Substrate sends `SIGTERM` so `libfx` releases its session lease (`await agent.close()`), snapshots `/workspace` to object storage, and stops the container. When the next HTTP request arrives for that actor, the router restores `/workspace` onto a worker pod and wakes the server back up before forwarding the request. On local kind, snapshots are stored in the bundled in-cluster S3 store (`rustfs`); on GKE, `atelet` and `ate-api-server` write snapshots to GCS using Workload Identity without any storage credentials in the actor.
-2. **Reconnectable event streaming**: `POST /submit` streams newline-delimited JSON (`turn.readable`) as the turn runs, stamping every event with a `cursor`. `GET /events?cursor=N` (`session.stream(cursor)`) replays or tails the session's durable event log from any cursor—even across actor suspends, restarts, or forks.
-3. **Checkpoint and fork**: Because both the agent session history (`.fx/sessions`) and the working files live in `/workspace`, you can tag a suspended actor (`kubectl ate create tag`) and create a new actor from that tag (`kubectl ate create actor --tag`). Both actors start from the same history and files, then diverge on subsequent requests.
-4. **Egress credential injection**: The sandbox runs with a placeholder `AI_GATEWAY_API_KEY`. Outbound calls to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which injects the real `Authorization` header from `egress-policy.yaml` so secrets never enter the sandbox or its snapshots.
+2. **Actor-scoped session lifecycle (get-or-create)**: In `local({ dir })` mode, `libfx` stores sessions as `runs/wrun_<ulid>.json`. On initial boot, `runs/` is empty so `agent.session(undefined)` creates a fresh session. On wake or fork, `existingRun` automatically finds and reopens the snapshot's existing run (`agent.session(sessionId)`), ensuring the session identity travels with the volume snapshot across forks without callers having to manage session IDs.
+3. **Reconnectable event streaming**: `POST /submit` streams newline-delimited JSON (`turn.readable`) as the turn runs, stamping every event with a `cursor`. `GET /events?cursor=N` (`session.stream(cursor)`) replays or tails the session's durable event log from any cursor—even across actor suspends, restarts, or forks.
+4. **Checkpoint and fork**: Because both the agent session history (`.fx/sessions`) and the working files live in `/workspace`, you can tag a suspended actor (`kubectl ate create tag`) and create a new actor from that tag (`kubectl ate create actor --tag`). Both actors start from the same history and files, then diverge on subsequent requests.
+5. **Egress credential injection**: The sandbox runs with a placeholder `AI_GATEWAY_API_KEY`. Outbound calls to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which injects the real `Authorization` header from `egress-policy.yaml` so secrets never enter the sandbox or its snapshots.
 
 ## Quickstart (local Kubernetes with kind)
 
