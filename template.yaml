@@ -6,7 +6,7 @@ workerSelector:
     workload: fx-durable
 containers:
 - name: fx-durable
-  image: localhost:5001/fx-durable-actor@sha256:01683456e9b137894fca726c5f36dc7d7c4569c8bbd69b48247da43e79c6f75c
+  image: localhost:5001/fx-durable-actor@sha256:4a941081d1546ce7e8c369b676aafffd55d847ba6bd759f5bc7481c33147c344
   command:
   - node
   - /app/server.ts

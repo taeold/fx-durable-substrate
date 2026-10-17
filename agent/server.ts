@@ -1,11 +1,10 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
+import { Readable } from "node:stream";
 import { json } from "node:stream/consumers";
 import { createFxAgent } from "libfx";
 import { local } from "libfx/durable-local";
 import { createCodingTools } from "./tools.ts";
-
-await mkdir("/workspace/.fx", { recursive: true });
 
 const agent = createFxAgent({
   model: "google/gemini-3.8-flash",
@@ -13,22 +12,22 @@ const agent = createFxAgent({
   tools: createCodingTools("/workspace"),
 });
 
-let sessionId: string;
-try {
-  sessionId = (await readFile("/workspace/.fx/session-id", "utf8")).trim();
-} catch {
-  sessionId = await agent.newSessionId();
-  await writeFile("/workspace/.fx/session-id", sessionId, "utf8");
-}
-await agent.session(sessionId).resume().result;
+const [run] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
+const session = agent.session(run?.slice(0, -5));
+await session.resume().result;
 
 const server = http.createServer(async (req, res) => {
   if (req.url === "/readyz") return res.end("ok\n");
+  if (req.method === "GET" && req.url?.startsWith("/events")) {
+    const cursor = Number(new URL(req.url, "http://localhost").searchParams.get("cursor") ?? 0);
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    const stream = Readable.fromWeb(session.stream(cursor));
+    req.on("close", () => stream.destroy());
+    return stream.pipe(res);
+  }
   const { prompt } = (await json(req)) as { prompt: string };
-  const turn = agent.session(sessionId).prompt(prompt);
-  const events = await Array.fromAsync(turn);
-  const settled = await turn.result;
-  res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ sessionId, settled, events }));
+  res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+  Readable.fromWeb(session.prompt(prompt).readable).pipe(res);
 });
 
 process.on("SIGTERM", async () => {

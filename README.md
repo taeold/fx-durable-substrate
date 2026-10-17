@@ -6,13 +6,12 @@ A simple durable AI coding agent built with [libfx](https://fx.sh/docs/lib) runn
 
 ```ts
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
+import { Readable } from "node:stream";
 import { json } from "node:stream/consumers";
 import { createFxAgent } from "libfx";
 import { local } from "libfx/durable-local";
 import { createCodingTools } from "./tools.ts";
-
-await mkdir("/workspace/.fx", { recursive: true });
 
 const agent = createFxAgent({
   model: "google/gemini-3.8-flash",
@@ -20,22 +19,22 @@ const agent = createFxAgent({
   tools: createCodingTools("/workspace"),
 });
 
-let sessionId: string;
-try {
-  sessionId = (await readFile("/workspace/.fx/session-id", "utf8")).trim();
-} catch {
-  sessionId = await agent.newSessionId();
-  await writeFile("/workspace/.fx/session-id", sessionId, "utf8");
-}
-await agent.session(sessionId).resume().result;
+const [run] = await readdir("/workspace/.fx/sessions/runs").catch(() => []);
+const session = agent.session(run?.slice(0, -5));
+await session.resume().result;
 
 const server = http.createServer(async (req, res) => {
   if (req.url === "/readyz") return res.end("ok\n");
+  if (req.method === "GET" && req.url?.startsWith("/events")) {
+    const cursor = Number(new URL(req.url, "http://localhost").searchParams.get("cursor") ?? 0);
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    const stream = Readable.fromWeb(session.stream(cursor));
+    req.on("close", () => stream.destroy());
+    return stream.pipe(res);
+  }
   const { prompt } = (await json(req)) as { prompt: string };
-  const turn = agent.session(sessionId).prompt(prompt);
-  const events = await Array.fromAsync(turn);
-  const settled = await turn.result;
-  res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ sessionId, settled, events }));
+  res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+  Readable.fromWeb(session.prompt(prompt).readable).pipe(res);
 });
 
 process.on("SIGTERM", async () => {
@@ -52,8 +51,9 @@ server.listen(80, "0.0.0.0");
 Agent Substrate runs each agent as an isolated actor with `/workspace` mounted as a durable directory (`durableDir` in `template.yaml`).
 
 1. **Suspend and auto-resume**: When you suspend an actor (`kubectl ate suspend actor`), Agent Substrate sends `SIGTERM` so `libfx` releases its session lease (`await agent.close()`), snapshots `/workspace` to object storage, and stops the container. When the next HTTP request arrives for that actor, the router restores `/workspace` onto a worker pod and wakes the server back up before forwarding the request. On local kind, snapshots are stored in the bundled in-cluster S3 store (`rustfs`); on GKE, `atelet` and `ate-api-server` write snapshots to GCS using Workload Identity without any storage credentials in the actor.
-2. **Checkpoint and fork**: Because both the agent session history (`.fx/sessions`) and the working files live in `/workspace`, you can tag a suspended actor (`kubectl ate create tag`) and create a new actor from that tag (`kubectl ate create actor --tag`). Both actors start from the same history and files, then diverge on subsequent requests.
-3. **Egress credential injection**: The sandbox runs with a placeholder `AI_GATEWAY_API_KEY`. Outbound calls to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which injects the real `Authorization` header from `egress-policy.yaml` so secrets never enter the sandbox or its snapshots.
+2. **Reconnectable event streaming**: `POST /submit` streams newline-delimited JSON (`turn.readable`) as the turn runs, stamping every event with a `cursor`. `GET /events?cursor=N` (`session.stream(cursor)`) replays or tails the session's durable event log from any cursor—even across actor suspends, restarts, or forks.
+3. **Checkpoint and fork**: Because both the agent session history (`.fx/sessions`) and the working files live in `/workspace`, you can tag a suspended actor (`kubectl ate create tag`) and create a new actor from that tag (`kubectl ate create actor --tag`). Both actors start from the same history and files, then diverge on subsequent requests.
+4. **Egress credential injection**: The sandbox runs with a placeholder `AI_GATEWAY_API_KEY`. Outbound calls to `ai-gateway.vercel.sh` pass through the Agent Substrate egress proxy, which injects the real `Authorization` header from `egress-policy.yaml` so secrets never enter the sandbox or its snapshots.
 
 ## Quickstart (local Kubernetes with kind)
 
@@ -104,67 +104,28 @@ kubectl -n ate-system rollout restart deployment/k8s-credential-provider
 kubectl port-forward -n ate-system svc/atenet-router 8000:80 &
 ```
 
-### 3. Create an actor and run Turn 1
+### 3. Create an actor and stream Turn 1
 
 ```bash
 kubectl ate create actor demo-agent --template fx-durable-data -a ate-demo-fx
 kubectl ate create egress-policy demo-agent -a ate-demo-fx -f egress-policy.yaml
 
-curl -X POST http://localhost:8000/submit \
+curl -N -X POST http://localhost:8000/submit \
   -H "ate-target-actor: ate-demo-fx/demo-agent" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
 ```
 
-Response snippet:
+Streamed NDJSON output:
 
 ```json
-{
-  "sessionId": "wrun_01M55DDV7TBB9FE8JGT4R9H1Q7",
-  "settled": {
-    "messageId": "msg_c390da34c67244f0a8ccbc54b3ab89d1",
-    "stopReason": "end_turn",
-    "usage": {},
-    "epoch": 1
-  },
-  "events": [
-    {
-      "type": "tool_start",
-      "id": "call_write_app",
-      "name": "write",
-      "input": { "path": "app.js", "content": "export function add(a, b) {\n  return a + b;\n}\n" },
-      "epoch": 1
-    },
-    {
-      "type": "tool_end",
-      "id": "call_write_app",
-      "name": "write",
-      "content": "{\"success\":true,\"path\":\"app.js\"}",
-      "isError": false,
-      "epoch": 1
-    },
-    {
-      "type": "tool_start",
-      "id": "call_write_test",
-      "name": "write",
-      "input": { "path": "test.js", "content": "import assert from 'node:assert/strict';\nimport { add } from './app.js';\nassert.equal(add(2, 3), 5);\nconsole.log('ok');\n" },
-      "epoch": 1
-    },
-    {
-      "type": "tool_end",
-      "id": "call_write_test",
-      "name": "write",
-      "content": "{\"success\":true,\"path\":\"test.js\"}",
-      "isError": false,
-      "epoch": 1
-    },
-    {
-      "type": "text_delta",
-      "delta": "Created `app.js` with `add(a, b)` and verified with `test.js`.",
-      "epoch": 1
-    }
-  ]
-}
+{"type":"turn_start","messageId":"msg_c390da34c67244f0a8ccbc54b3ab89d1","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Create app.js with add(a, b) and a test.js that verifies it.","epoch":1,"cursor":2}
+{"type":"tool_start","id":"call_write_app","name":"write","input":{"path":"app.js","content":"export function add(a, b) {\n  return a + b;\n}\n"},"epoch":1,"cursor":3}
+{"type":"tool_end","id":"call_write_app","name":"write","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":1,"cursor":4}
+{"type":"tool_start","id":"call_write_test","name":"write","input":{"path":"test.js","content":"import assert from 'node:assert/strict';\nimport { add } from './app.js';\nassert.equal(add(2, 3), 5);\nconsole.log('ok');\n"},"epoch":1,"cursor":5}
+{"type":"tool_end","id":"call_write_test","name":"write","content":"{\"success\":true,\"path\":\"test.js\"}","isError":false,"epoch":1,"cursor":6}
+{"type":"text_delta","delta":"Created `app.js` with `add(a, b)` and verified with `test.js`.","epoch":1,"cursor":7}
+{"type":"turn_end","messageId":"msg_c390da34c67244f0a8ccbc54b3ab89d1","stopReason":"end_turn","usage":{},"epoch":1,"cursor":8}
 ```
 
 ### 4. Suspend, tag a checkpoint, and fork
@@ -181,62 +142,45 @@ kubectl ate create egress-policy demo-agent-fork -a ate-demo-fx -f egress-policy
 
 ### 5. Send divergent prompts to both branches
 
-Both actors auto-resume on demand from the shared Turn 1 history (`epoch: 1`) and diverge on Turn 2 (`epoch: 2`):
+Both actors auto-resume on demand from the shared Turn 1 history (`cursor: 1..8`) and diverge on Turn 2 (`cursor: 9..`):
 
 ```bash
 # Original actor continues on Branch A
-curl -X POST http://localhost:8000/submit \
+curl -N -X POST http://localhost:8000/submit \
   -H "ate-target-actor: ate-demo-fx/demo-agent" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
 
 # Forked actor continues on Branch B
-curl -X POST http://localhost:8000/submit \
+curl -N -X POST http://localhost:8000/submit \
   -H "ate-target-actor: ate-demo-fx/demo-agent-fork" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
 ```
 
-Response snippet from `demo-agent` (Branch A):
+Streamed output from `demo-agent` (Branch A):
 
 ```json
-{
-  "sessionId": "wrun_01M55DDV7TBB9FE8JGT4R9H1Q7",
-  "settled": { "stopReason": "end_turn", "epoch": 2 },
-  "events": [
-    {
-      "type": "tool_start",
-      "name": "edit",
-      "input": {
-        "path": "app.js",
-        "oldText": "return a + b;\n}",
-        "newText": "return a + b;\n}\n\nexport function multiply(a, b) {\n  return a * b;\n}\n"
-      },
-      "epoch": 2
-    },
-    { "type": "text_delta", "delta": "Added `multiply(a, b)` to `app.js`.", "epoch": 2 }
-  ]
-}
+{"type":"turn_start","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add multiply(a, b) and structured logging to app.js.","epoch":2,"cursor":9}
+{"type":"tool_start","id":"call_edit_multiply","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function multiply(a, b) {\n  return a * b;\n}\n"},"epoch":2,"cursor":10}
+{"type":"tool_end","id":"call_edit_multiply","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":11}
+{"type":"text_delta","delta":"Added `multiply(a, b)` to `app.js`.","epoch":2,"cursor":12}
+{"type":"turn_end","messageId":"msg_9c31f4a0db0e4fc093385f80631214c5","stopReason":"end_turn","usage":{},"epoch":2,"cursor":13}
 ```
 
-Response snippet from `demo-agent-fork` (Branch B):
+Streamed output from `demo-agent-fork` (Branch B):
 
 ```json
-{
-  "sessionId": "wrun_01M55DDV7TBB9FE8JGT4R9H1Q7",
-  "settled": { "stopReason": "end_turn", "epoch": 2 },
-  "events": [
-    {
-      "type": "tool_start",
-      "name": "edit",
-      "input": {
-        "path": "app.js",
-        "oldText": "return a + b;\n}",
-        "newText": "return a + b;\n}\n\nexport function divide(a, b) {\n  if (b === 0) throw new Error('div by zero');\n  return a / b;\n}\n"
-      },
-      "epoch": 2
-    },
-    { "type": "text_delta", "delta": "Added `divide(a, b)` with error check to `app.js`.", "epoch": 2 }
-  ]
-}
+{"type":"turn_start","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","sessionId":"wrun_01M55DDV7TBB9FE8JGT4R9H1Q7","input":"Add divide(a, b) and edge-case tests to test.js.","epoch":2,"cursor":9}
+{"type":"tool_start","id":"call_edit_divide","name":"edit","input":{"path":"app.js","oldText":"return a + b;\n}","newText":"return a + b;\n}\n\nexport function divide(a, b) {\n  if (b === 0) throw new Error('div by zero');\n  return a / b;\n}\n"},"epoch":2,"cursor":10}
+{"type":"tool_end","id":"call_edit_divide","name":"edit","content":"{\"success\":true,\"path\":\"app.js\"}","isError":false,"epoch":2,"cursor":11}
+{"type":"text_delta","delta":"Added `divide(a, b)` with error check to `app.js`.","epoch":2,"cursor":12}
+{"type":"turn_end","messageId":"msg_88d363c6c14a4e4384396f13c334cc42","stopReason":"end_turn","usage":{},"epoch":2,"cursor":13}
+```
+
+You can also replay or tail either actor's event stream from any cursor:
+
+```bash
+curl -N "http://localhost:8000/events?cursor=8" \
+  -H "ate-target-actor: ate-demo-fx/demo-agent-fork"
 ```
